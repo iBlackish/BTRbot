@@ -1,10 +1,12 @@
 const tmi = require('tmi.js');
 const fetch = require('node-fetch').default;
-const https = require('https');
 
-// Use environment variables instead of hardcoded values
+// Use environment variables (set these in Render dashboard)
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
+
+// Track voters for current phase (resets each voting phase)
+let currentPhaseVoters = new Set();
 
 const client = new tmi.Client({
   options: { debug: true },
@@ -21,12 +23,19 @@ const client = new tmi.Client({
   channels: ['#iblackish_']
 });
 
+// Startup validation
+console.log('🚀 Be the Ripple IRC listener is starting...');
+console.log(`📡 Using Supabase URL: ${SUPABASE_URL}`);
+
+if (!SUPABASE_KEY || !SUPABASE_URL) {
+  console.error('❌ ERROR: Missing SUPABASE_KEY or SUPABASE_URL environment variables!');
+}
+
 // Connect with full error handling and retry
 function connectWithRetry(attempts = 0) {
   client.connect()
     .then(() => {
       console.log('✅ CONNECTED TO iBLACKISH_ CHAT!');
-      console.log(`📡 Using Supabase URL: ${SUPABASE_URL}`);
     })
     .catch((err) => {
       console.error(`❌ Connection attempt ${attempts + 1} failed:`, err.message);
@@ -65,10 +74,19 @@ client.on('message', (channel, tags, message, self) => {
     sendToSupabase('channel.subscription.gift', username, 1, '');
   }
 
-  // Sub-only votes (!1 !2 !3)
+  // Sub-only votes (!1 !2 !3) - ONE VOTE PER USER PER PHASE
   if (message.match(/^![123]$/) && (tags.subscriber === true || tags.subscriber === '1')) {
     const choice = message[1];
-    console.log(`→ Vote detected: !${choice} from sub ${username}`);
+    
+    // Check if user already voted this phase
+    if (currentPhaseVoters.has(username)) {
+      console.log(`⚠️ Vote BLOCKED: ${username} already voted this phase`);
+      return; // Don't process duplicate vote
+    }
+    
+    // Record this voter and process the vote
+    currentPhaseVoters.add(username);
+    console.log(`→ Vote detected: !${choice} from sub ${username} (${currentPhaseVoters.size} unique voters this phase)`);
     sendToSupabase('vote', username, 1, choice);
   }
 
@@ -81,11 +99,15 @@ client.on('message', (channel, tags, message, self) => {
   // Secret streamer commands (only you)
   if (username.toLowerCase() === 'iblackish_') {
     if (message.startsWith('!ripple_start')) {
+      // RESET VOTERS FOR NEW PHASE
+      currentPhaseVoters.clear();
+      console.log(`→ 🔄 NEW VOTING PHASE STARTED - Voter list cleared!`);
       console.log(`→ Secret start from iBlackish_`);
       sendToSupabase('secret_start', 'iblackish_', 1, message.slice(14).trim());
     }
+
     if (message === '!ripple_end') {
-      console.log(`→ Secret end from iBlackish_`);
+      console.log(`→ Secret end from iBlackish_ (${currentPhaseVoters.size} total voters this phase)`);
       sendToSupabase('secret_end', 'iblackish_', 1, '');
     }
   }
@@ -94,7 +116,6 @@ client.on('message', (channel, tags, message, self) => {
 function sendToSupabase(type, user, amount, msg) {
   console.log(`→ Sending to Supabase: ${type} | ${user} | amount:${amount} | "${msg}"`);
   
-  // Use environment variable for URL
   fetch(`${SUPABASE_URL}/rest/v1/events_queue`, {
     method: 'POST',
     headers: {
@@ -114,5 +135,3 @@ function sendToSupabase(type, user, amount, msg) {
   })
   .catch(err => console.error('❌ Fetch failed →', err));
 }
-
-console.log('Be the Ripple IRC listener is starting...');

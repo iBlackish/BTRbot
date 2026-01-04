@@ -2,7 +2,9 @@ const tmi = require('tmi.js');
 const fetch = require('node-fetch').default;
 const https = require('https');
 
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFkbGpha2VhZ3d3a2J5dm92YmF0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ0ODc2ODQsImV4cCI6MjA4MDA2MzY4NH0.ZqSHBDuIaMWHTDn_zCy1XAbyTRqu7jlBxKouwFLQLX8';
+// Use environment variables instead of hardcoded values
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
 
 const client = new tmi.Client({
   options: { debug: true },
@@ -16,7 +18,7 @@ const client = new tmi.Client({
     username: 'iblackish_',
     password: 'oauth:224pzci41bk1jw6qy2d2icsrvbikx1'
   },
-  channels: ['#iblackish_']  // Note: # prefix and exact username
+  channels: ['#iblackish_']
 });
 
 // Connect with full error handling and retry
@@ -24,6 +26,7 @@ function connectWithRetry(attempts = 0) {
   client.connect()
     .then(() => {
       console.log('✅ CONNECTED TO iBLACKISH_ CHAT!');
+      console.log(`📡 Using Supabase URL: ${SUPABASE_URL}`);
     })
     .catch((err) => {
       console.error(`❌ Connection attempt ${attempts + 1} failed:`, err.message);
@@ -90,7 +93,9 @@ client.on('message', (channel, tags, message, self) => {
 
 function sendToSupabase(type, user, amount, msg) {
   console.log(`→ Sending to Supabase: ${type} | ${user} | amount:${amount} | "${msg}"`);
-  fetch('https://adljakeagwwkbyvovbat.supabase.co/rest/v1/events_queue', {
+  
+  // Use environment variable for URL
+  fetch(`${SUPABASE_URL}/rest/v1/events_queue`, {
     method: 'POST',
     headers: {
       'apikey': SUPABASE_KEY,

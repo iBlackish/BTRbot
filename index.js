@@ -1,45 +1,55 @@
-const tmi = require('tmi.js');
-const fetch = require('node-fetch').default;
-const { createClient } = require('@supabase/supabase-js');
+import tmi from 'tmi.js';
+import { createClient } from '@supabase/supabase-js';
 
-// Use environment variables (set these in Render dashboard)
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// Environment variables
+const TWITCH_BOT_USERNAME = process.env.TWITCH_BOT_USERNAME;
+const TWITCH_OAUTH_TOKEN = process.env.TWITCH_OAUTH_TOKEN;
+const TWITCH_CHANNEL = process.env.TWITCH_CHANNEL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Create Supabase client for realtime subscription
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// Initialize Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Track voters for current phase (resets each voting phase)
-let currentPhaseVoters = new Set();
+// Track voters per phase to enforce one-vote-per-user
+const currentPhaseVoters = new Set();
 
+// Track current voting phase subscription channel
+let votingPhaseChannel = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY = 2000; // 2 seconds
+
+// Initialize Twitch client
 const client = new tmi.Client({
-  options: { debug: true },
-  connection: {
-    reconnect: true,
-    secure: true,
-    server: 'irc-ws.chat.twitch.tv',
-    port: 443
-  },
+  options: { debug: false },
   identity: {
-    username: 'iblackish_',
-    password: 'oauth:224pzci41bk1jw6qy2d2icsrvbikx1'
+    username: TWITCH_BOT_USERNAME,
+    password: TWITCH_OAUTH_TOKEN
   },
-  channels: ['#iblackish_']
+  channels: [TWITCH_CHANNEL]
 });
 
-// Startup validation
-console.log('🚀 Be the Ripple IRC listener is starting...');
-console.log(`📡 Using Supabase URL: ${SUPABASE_URL}`);
-if (!SUPABASE_KEY || !SUPABASE_URL) {
-  console.error('❌ ERROR: Missing SUPABASE_KEY or SUPABASE_URL environment variables!');
-}
+// Subscribe to voting phase events from Supabase
+async function subscribeToVotingPhases() {
+  // Clean up existing channel first
+  if (votingPhaseChannel) {
+    console.log('🧹 Cleaning up old voting phase subscription...');
+    try {
+      await supabase.removeChannel(votingPhaseChannel);
+    } catch (err) {
+      console.log('⚠️ Error removing old channel:', err.message);
+    }
+    votingPhaseChannel = null;
+  }
 
-// Subscribe to voting_phase_start events from Lovable system
-function subscribeToVotingPhases() {
   console.log('📡 Subscribing to voting phase events...');
   
-  const channel = supabase
-    .channel('voting_phase_listener')
+  // Use unique channel name to avoid conflicts
+  const channelName = `voting_phases_${Date.now()}`;
+  
+  votingPhaseChannel = supabase
+    .channel(channelName)
     .on(
       'postgres_changes',
       {
@@ -49,129 +59,141 @@ function subscribeToVotingPhases() {
         filter: 'event_type=eq.voting_phase_start'
       },
       (payload) => {
-        console.log('🔔 VOTING PHASE START detected from Lovable system!');
-        console.log(`   Previous phase had ${currentPhaseVoters.size} unique voters`);
+        console.log('🗳️ Voting phase started! Clearing voter list.');
         currentPhaseVoters.clear();
-        console.log('✅ Voter list cleared - ready for new voting phase!');
+        reconnectAttempts = 0; // Reset on successful message
       }
     )
     .subscribe((status, err) => {
       if (status === 'SUBSCRIBED') {
         console.log('✅ Successfully subscribed to voting phase events');
+        reconnectAttempts = 0; // Reset on successful subscription
       } else if (status === 'CHANNEL_ERROR') {
         console.error('❌ Voting phase subscription error:', err);
-        setTimeout(subscribeToVotingPhases, 5000);
+        scheduleReconnect();
       } else if (status === 'CLOSED') {
-        console.warn('⚠️ Voting phase subscription closed, reconnecting...');
-        setTimeout(subscribeToVotingPhases, 2000);
-      }
-    });
-    
-  return channel;
-}
-
-// Connect with full error handling and retry
-function connectWithRetry(attempts = 0) {
-  client.connect()
-    .then(() => {
-      console.log('✅ CONNECTED TO iBLACKISH_ CHAT!');
-      // Start listening for voting phase events from Lovable
-      subscribeToVotingPhases();
-    })
-    .catch((err) => {
-      console.error(`❌ Connection attempt ${attempts + 1} failed:`, err.message);
-      console.error('Full error:', err);
-      if (attempts < 3) {
-        console.log('Retrying in 5 seconds...');
-        setTimeout(() => connectWithRetry(attempts + 1), 5000);
-      } else {
-        console.error('Max retries reached. Check token or network.');
+        console.log('⚠️ Voting phase subscription closed');
+        scheduleReconnect();
       }
     });
 }
 
-connectWithRetry();
+// Schedule a reconnection with exponential backoff
+function scheduleReconnect() {
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    console.error('❌ Max reconnection attempts reached. Manual restart required.');
+    return;
+  }
 
-client.on('message', (channel, tags, message, self) => {
+  reconnectAttempts++;
+  const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts - 1), 60000);
+  console.log(`🔄 Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+  
+  setTimeout(() => {
+    subscribeToVotingPhases();
+  }, delay);
+}
+
+// Handle chat messages
+client.on('message', async (channel, tags, message, self) => {
   if (self) return;
 
-  const username = tags.username;
+  const username = tags['display-name'] || tags.username;
+  const isBroadcaster = tags.badges?.broadcaster === '1';
+  const isMod = tags.mod;
+  const isSubscriber = tags.subscriber;
+  const bits = parseInt(tags.bits) || 0;
 
-  // Bits cheers
-  if (tags.bits && tags.bits > 0) {
-    console.log(`→ Bits detected: ${tags.bits} from ${username}`);
-    sendToSupabase('channel.cheer', username, tags.bits, '');
+  // Handle bits (cheers)
+  if (bits > 0) {
+    await supabase.from('events_queue').insert({
+      event_type: 'channel.cheer',
+      user_name: username,
+      amount: bits,
+      message: message
+    });
+    console.log(`💎 ${username} cheered ${bits} bits`);
   }
 
-  // New sub / resub
-  if (tags['msg-id'] === 'sub' || tags['msg-id'] === 'resub') {
-    console.log(`→ Sub detected: ${tags['msg-id']} from ${username}`);
-    sendToSupabase('channel.subscribe', username, 1, '');
-  }
-
-  // Gifted subs
-  if (tags['msg-id'] === 'subgift' || tags['msg-id'] === 'anonsubgift') {
-    console.log(`→ Gift sub detected: ${tags['msg-id']} from ${username}`);
-    sendToSupabase('channel.subscription.gift', username, 1, '');
-  }
-
-  // ALL VIEWER votes (!1 !2 !3) - ONE VOTE PER USER PER PHASE
-  // Changed from subscriber-only to allow everyone to participate
-  if (message.match(/^![123]$/)) {
-    const choice = message[1];
-    
+  // Handle votes (!1, !2, !3) - ALL viewers can vote, one per phase
+  if (['!1', '!2', '!3'].includes(message.trim())) {
     // Check if user already voted this phase
-    if (currentPhaseVoters.has(username)) {
-      console.log(`⚠️ Vote BLOCKED: ${username} already voted this phase`);
+    if (currentPhaseVoters.has(username.toLowerCase())) {
+      console.log(`🚫 ${username} already voted this phase`);
       return;
     }
+
+    const voteNumber = message.trim().charAt(1);
+    await supabase.from('events_queue').insert({
+      event_type: 'vote',
+      user_name: username,
+      amount: 1,
+      message: voteNumber
+    });
     
-    // Record this voter and process the vote
-    currentPhaseVoters.add(username);
-    console.log(`→ Vote detected: !${choice} from ${username} (${currentPhaseVoters.size} unique voters this phase)`);
-    sendToSupabase('vote', username, 1, choice);
+    // Mark user as voted for this phase
+    currentPhaseVoters.add(username.toLowerCase());
+    console.log(`🗳️ ${username} voted for option ${voteNumber}`);
   }
 
-  // Boss fight spam (!attack)
-  if (message.toLowerCase() === '!attack') {
-    console.log(`→ Attack detected from ${username}`);
-    sendToSupabase('boss_attack', username, 1, '');
-  }
-
-  // Secret streamer commands (only you) - MANUAL BACKUP
-  if (username.toLowerCase() === 'iblackish_') {
-    if (message.startsWith('!ripple_start')) {
-      currentPhaseVoters.clear();
-      console.log(`→ 🔄 MANUAL VOTING PHASE RESET - Voter list cleared!`);
-      console.log(`→ Secret start from iBlackish_`);
-      sendToSupabase('secret_start', 'iblackish_', 1, message.slice(14).trim());
-    }
-    if (message === '!ripple_end') {
-      console.log(`→ Secret end from iBlackish_ (${currentPhaseVoters.size} total voters this phase)`);
-      sendToSupabase('secret_end', 'iblackish_', 1, '');
-    }
+  // Handle attack command during boss battles
+  if (message.trim().toLowerCase() === '!attack') {
+    // Could add companion roster check here if needed
+    console.log(`⚔️ ${username} used !attack`);
+    // Attack handling is done via the battle-actions edge function
   }
 });
 
-function sendToSupabase(type, user, amount, msg) {
-  console.log(`→ Sending to Supabase: ${type} | ${user} | amount:${amount} | "${msg}"`);
-  
-  fetch(`${SUPABASE_URL}/rest/v1/events_queue`, {
-    method: 'POST',
-    headers: {
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=minimal'
-    },
-    body: JSON.stringify({ event_type: type, user_name: user, amount, message: msg })
+// Handle subscriptions
+client.on('subscription', async (channel, username, method, message, userstate) => {
+  await supabase.from('events_queue').insert({
+    event_type: 'channel.subscribe',
+    user_name: username,
+    amount: 1,
+    message: message || ''
+  });
+  console.log(`⭐ ${username} subscribed!`);
+});
+
+// Handle gift subs
+client.on('submysterygift', async (channel, username, numbOfSubs, methods, userstate) => {
+  await supabase.from('events_queue').insert({
+    event_type: 'channel.subscription.gift',
+    user_name: username,
+    amount: numbOfSubs,
+    message: `Gifted ${numbOfSubs} subs`
+  });
+  console.log(`🎁 ${username} gifted ${numbOfSubs} subs!`);
+});
+
+// Handle resubs
+client.on('resub', async (channel, username, months, message, userstate, methods) => {
+  await supabase.from('events_queue').insert({
+    event_type: 'channel.subscribe',
+    user_name: username,
+    amount: 1,
+    message: message || `Resubbed for ${months} months`
+  });
+  console.log(`⭐ ${username} resubscribed for ${months} months!`);
+});
+
+// Connect to Twitch
+client.connect()
+  .then(() => {
+    console.log(`✅ CONNECTED TO ${TWITCH_CHANNEL.toUpperCase()} CHAT!`);
+    // Start voting phase subscription after Twitch connection
+    subscribeToVotingPhases();
   })
-  .then(res => {
-    if (res.ok) {
-      console.log('✅ SUCCESS → Row inserted in Supabase!');
-    } else {
-      console.error('❌ Supabase rejected →', res.status, res.statusText);
-    }
-  })
-  .catch(err => console.error('❌ Fetch failed →', err));
-}
+  .catch(err => {
+    console.error('Failed to connect to Twitch:', err);
+  });
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 Shutting down...');
+  if (votingPhaseChannel) {
+    await supabase.removeChannel(votingPhaseChannel);
+  }
+  await client.disconnect();
+  process.exit(0);
+});

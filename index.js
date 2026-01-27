@@ -1,5 +1,5 @@
-import tmi from 'tmi.js';
-import { createClient } from '@supabase/supabase-js';
+const tmi = require('tmi.js');
+const { createClient } = require('@supabase/supabase-js');
 
 // Environment variables
 const TWITCH_BOT_USERNAME = process.env.TWITCH_BOT_USERNAME;

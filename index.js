@@ -12,6 +12,7 @@ const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 const TWITCH_REFRESH_TOKEN = process.env.TWITCH_REFRESH_TOKEN;
 const TWITCH_CHANNEL = process.env.TWITCH_CHANNEL || 'iblackish_';
 const TWITCH_BOT_USERNAME = process.env.TWITCH_BOT_USERNAME || 'iblackish_';
+const TWITCH_BROADCASTER_ID = process.env.TWITCH_BROADCASTER_ID || '172537045';
 
 // Create Supabase client for realtime subscription
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -59,9 +60,36 @@ const REALM_NAMES = [
 ];
 
 // ============================================
+// NARRATOR STATE TRACKING
+// ============================================
+let lastEpisodePhase = 'idle';
+let lastSequencerPhase = 'idle';
+let lastPhaseBitsTotal = 0;
+let announcedEnhancements = new Set(); // Track which enhancement tiers we've announced
+let currentBossName = '';
+let currentAccessToken = null; // Store access token for Helix API calls
+
+// Announcement queue for rate limiting
+let announcementQueue = [];
+let isProcessingQueue = false;
+const ANNOUNCEMENT_DELAY_MS = 3500; // 3.5 seconds between announcements
+
+// Enhancement tier definitions
+const ENHANCEMENT_TIERS = [
+  { threshold: 250, name: 'Coral Shield', description: 'iBlackish now deflects minor corruption attacks!' },
+  { threshold: 500, name: 'Trident Shard', description: 'iBlackish can now channel ancient sea magic!' },
+  { threshold: 750, name: 'Ancient Blessing', description: 'iBlackish now has full protection from shadow!' }
+];
+
+// ============================================
 // SUPABASE SUBSCRIPTION STATE
 // ============================================
 let votingPhaseChannel = null;
+let sequencerStateChannel = null;
+let bossCompanionsChannel = null;
+let companionBattleChannel = null;
+let battleStateChannel = null;
+
 let isSubscribing = false; // Guard to prevent duplicate subscription attempts
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -77,12 +105,16 @@ let twitchClient = null;
 // ============================================
 console.log('🚀 Be the Ripple IRC listener is starting...');
 console.log(`📡 Using Supabase URL: ${SUPABASE_URL}`);
+console.log(`📢 Narrator enabled with Broadcaster ID: ${TWITCH_BROADCASTER_ID}`);
 
 if (!SUPABASE_KEY || !SUPABASE_URL) {
   console.error('❌ ERROR: Missing SUPABASE_KEY or SUPABASE_URL environment variables!');
 }
 if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !TWITCH_REFRESH_TOKEN) {
   console.error('❌ ERROR: Missing TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, or TWITCH_REFRESH_TOKEN!');
+}
+if (!TWITCH_BROADCASTER_ID) {
+  console.warn('⚠️ WARNING: Missing TWITCH_BROADCASTER_ID - announcements will fall back to regular chat');
 }
 
 // ============================================
@@ -108,8 +140,87 @@ async function getAccessToken() {
   }
 
   const data = await response.json();
+  currentAccessToken = data.access_token; // Store for Helix API calls
   console.log('✅ Access token retrieved successfully!');
   return data.access_token;
+}
+
+// ============================================
+// ORANGE ANNOUNCEMENT SYSTEM
+// ============================================
+async function sendAnnouncement(message, color = 'orange') {
+  // Add to queue for rate limiting
+  announcementQueue.push({ message, color });
+  processAnnouncementQueue();
+}
+
+async function processAnnouncementQueue() {
+  if (isProcessingQueue || announcementQueue.length === 0) return;
+  
+  isProcessingQueue = true;
+  
+  while (announcementQueue.length > 0) {
+    const { message, color } = announcementQueue.shift();
+    await sendAnnouncementNow(message, color);
+    
+    // Wait between announcements to respect rate limits
+    if (announcementQueue.length > 0) {
+      await new Promise(resolve => setTimeout(resolve, ANNOUNCEMENT_DELAY_MS));
+    }
+  }
+  
+  isProcessingQueue = false;
+}
+
+async function sendAnnouncementNow(message, color = 'orange') {
+  // Ensure we have a valid access token
+  if (!currentAccessToken) {
+    try {
+      await getAccessToken();
+    } catch (err) {
+      console.error('❌ Failed to get access token for announcement:', err.message);
+      fallbackToChat(message);
+      return;
+    }
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.twitch.tv/helix/chat/announcements?broadcaster_id=${TWITCH_BROADCASTER_ID}&moderator_id=${TWITCH_BROADCASTER_ID}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${currentAccessToken}`,
+          'Client-Id': TWITCH_CLIENT_ID,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ message, color })
+      }
+    );
+    
+    if (response.status === 204) {
+      console.log(`📢 ANNOUNCEMENT SENT: ${message}`);
+    } else if (response.status === 401) {
+      // Token expired, refresh and retry
+      console.log('🔄 Token expired, refreshing...');
+      await getAccessToken();
+      return sendAnnouncementNow(message, color);
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ Announcement failed (${response.status}): ${errorText}`);
+      fallbackToChat(message);
+    }
+  } catch (error) {
+    console.error('❌ Announcement error:', error.message);
+    fallbackToChat(message);
+  }
+}
+
+function fallbackToChat(message) {
+  if (twitchClient) {
+    console.log(`💬 Fallback to regular chat: ${message}`);
+    twitchClient.say(`#${TWITCH_CHANNEL}`, message);
+  }
 }
 
 // ============================================
@@ -148,6 +259,9 @@ async function connectTwitch() {
     
     // Start listening for voting phase events
     subscribeToVotingPhases();
+    
+    // Start listening for narrator events (sequencer state, battles, etc.)
+    subscribeToNarratorEvents();
     
   } catch (err) {
     console.error('❌ Twitch connection failed:', err.message);
@@ -261,6 +375,10 @@ function handleMessage(channel, tags, message, self) {
       userRealmVotes.clear();
       console.log(`→ 🌍 MANUAL REALM VOTING END`);
     }
+    // Manual narrator test
+    if (message === '!test_announce') {
+      sendAnnouncement('🧪 This is a test announcement from the BTR Narrator!');
+    }
   }
 }
 
@@ -322,6 +440,14 @@ async function subscribeToVotingPhases() {
           
           console.log('✅ Realm voting mode ENABLED - accepting !1 through !25');
           reconnectAttempts = 0;
+          
+          // NARRATOR: Episode start announcement
+          sendAnnouncement(`BTR: Becoming the Ripple is starting now! This is Season 1, Episode ${currentEpisodeNumber}!`);
+          
+          // NARRATOR: Realm voting instructions (delayed slightly)
+          setTimeout(() => {
+            sendAnnouncement("Now is the time to vote for tonight's 3 realms! Type !1 - !25 to vote; you can vote up to three times!");
+          }, 5000);
         }
         
         // REALM VOTING END - disable realm voting mode
@@ -349,6 +475,9 @@ async function subscribeToVotingPhases() {
           currentPhaseVoters.clear();
           console.log('✅ Story voter list cleared - ready for new voting phase!');
           reconnectAttempts = 0;
+          
+          // NARRATOR: Voting phase announcement
+          sendAnnouncement("It's time to vote! Type !1, !2, or !3 to vote for an option. You can also contribute bits towards one of the enhancements on the left side of the screen! If any of the bit levels are reached, it will contribute directly to the story!");
         }
       }
     )
@@ -366,6 +495,275 @@ async function subscribeToVotingPhases() {
     });
     
   return votingPhaseChannel;
+}
+
+// ============================================
+// NARRATOR EVENT SUBSCRIPTIONS
+// ============================================
+async function subscribeToNarratorEvents() {
+  console.log('📢 Setting up Narrator event subscriptions...');
+  
+  // Subscribe to sequencer_state for phase changes
+  await subscribeToSequencerState();
+  
+  // Subscribe to boss_companions for new companion announcements
+  await subscribeToBossCompanions();
+  
+  // Subscribe to companion_battle_state for death announcements
+  await subscribeToCompanionBattleState();
+  
+  // Subscribe to battle_state for battle outcome announcements
+  await subscribeToBattleState();
+}
+
+async function subscribeToSequencerState() {
+  if (sequencerStateChannel) {
+    try {
+      await supabase.removeChannel(sequencerStateChannel);
+    } catch (err) {
+      console.log('⚠️ Error removing old sequencer channel:', err.message);
+    }
+  }
+  
+  const channelName = `sequencer_narrator_${Date.now()}`;
+  
+  sequencerStateChannel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'sequencer_state'
+      },
+      (payload) => {
+        const newState = payload.new;
+        const oldState = payload.old;
+        
+        const newEpisodePhase = newState?.episode_phase;
+        const newPhase = newState?.phase;
+        const phaseBitsTotal = newState?.phase_bits_total || 0;
+        const episodeNumber = newState?.episode_number || 1;
+        
+        // Update current episode number
+        currentEpisodeNumber = episodeNumber;
+        
+        // Track boss name for battle outcome messages
+        if (newState?.current_realm) {
+          // We'll get the actual boss name from battle_state
+        }
+        
+        // EPISODE PHASE CHANGES
+        if (newEpisodePhase !== lastEpisodePhase) {
+          console.log(`📢 Episode phase changed: ${lastEpisodePhase} → ${newEpisodePhase}`);
+          
+          // Recap (episodes 2+)
+          if (newEpisodePhase === 'recap' && episodeNumber > 1) {
+            sendAnnouncement("Last week on BTR: Becoming the Ripple...");
+          }
+          
+          // How-to-Play
+          if (newEpisodePhase === 'how_to_play') {
+            sendAnnouncement("These are instructions on how to play/choose the adventure!");
+          }
+          
+          // Pre-Battle
+          if (newEpisodePhase === 'pre_battle') {
+            sendAnnouncement("A boss battle is about to begin! iBlackish has gathered his companions to determine the fate of the realm!");
+            
+            // Staggered second message about healing
+            setTimeout(() => {
+              sendAnnouncement("Viewers can heal companions with bits! 100 bits heals 5% of up to 5 companions! Gift subs resurrect fallen companions!");
+            }, 5000);
+          }
+          
+          // Outro
+          if (newEpisodePhase === 'outro') {
+            sendAnnouncement("Thank you for watching BTR: Becoming the Ripple! Join us next week as we continue the adventure! Which realms will we tackle next week?! Tune in to find out!");
+          }
+          
+          lastEpisodePhase = newEpisodePhase;
+        }
+        
+        // SEQUENCER PHASE CHANGES (playing_leadin, playing_segment)
+        if (newPhase !== lastSequencerPhase) {
+          console.log(`📢 Sequencer phase changed: ${lastSequencerPhase} → ${newPhase}`);
+          
+          // Lead-in (choice being implemented)
+          if (newPhase === 'playing_leadin') {
+            sendAnnouncement("Chat's decision is being written into the story. Let's see where it goes!");
+          }
+          
+          // New segment after lead-in
+          if (newPhase === 'playing_segment' && lastSequencerPhase === 'playing_leadin') {
+            sendAnnouncement("Chat's decision has been implemented! Watch this!");
+          }
+          
+          lastSequencerPhase = newPhase;
+        }
+        
+        // ENHANCEMENT TIER ANNOUNCEMENTS
+        if (phaseBitsTotal > lastPhaseBitsTotal) {
+          for (const tier of ENHANCEMENT_TIERS) {
+            if (phaseBitsTotal >= tier.threshold && !announcedEnhancements.has(tier.threshold)) {
+              announcedEnhancements.add(tier.threshold);
+              sendAnnouncement(`Chat has contributed ${tier.threshold} bits and unlocked ${tier.name}! ${tier.description}`);
+            }
+          }
+        }
+        lastPhaseBitsTotal = phaseBitsTotal;
+        
+        // Reset enhancement tracking when bits reset (new voting phase)
+        if (phaseBitsTotal === 0 && lastPhaseBitsTotal > 0) {
+          announcedEnhancements.clear();
+        }
+      }
+    )
+    .subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('✅ Subscribed to sequencer_state for narrator');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('❌ Sequencer state subscription error:', err);
+      }
+    });
+}
+
+async function subscribeToBossCompanions() {
+  if (bossCompanionsChannel) {
+    try {
+      await supabase.removeChannel(bossCompanionsChannel);
+    } catch (err) {
+      console.log('⚠️ Error removing old companions channel:', err.message);
+    }
+  }
+  
+  const channelName = `companions_narrator_${Date.now()}`;
+  
+  bossCompanionsChannel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'boss_companions'
+      },
+      (payload) => {
+        const username = payload.new?.username;
+        if (username) {
+          console.log(`📢 New companion joined: ${username}`);
+          sendAnnouncement(`${username} has been added to the companion roster for the next boss battle!`);
+        }
+      }
+    )
+    .subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('✅ Subscribed to boss_companions for narrator');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('❌ Boss companions subscription error:', err);
+      }
+    });
+}
+
+async function subscribeToCompanionBattleState() {
+  if (companionBattleChannel) {
+    try {
+      await supabase.removeChannel(companionBattleChannel);
+    } catch (err) {
+      console.log('⚠️ Error removing old battle state channel:', err.message);
+    }
+  }
+  
+  const channelName = `companion_deaths_narrator_${Date.now()}`;
+  
+  companionBattleChannel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'companion_battle_state'
+      },
+      (payload) => {
+        const wasAlive = payload.old?.is_alive;
+        const isAlive = payload.new?.is_alive;
+        const username = payload.new?.username;
+        
+        // Companion just died
+        if (wasAlive === true && isAlive === false && username) {
+          console.log(`📢 Companion slain: ${username}`);
+          sendAnnouncement(`${username} has been slain! May they not be forgotten. (Remember: chat can resurrect fallen companions by gifting a sub!)`);
+        }
+      }
+    )
+    .subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('✅ Subscribed to companion_battle_state for narrator');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('❌ Companion battle state subscription error:', err);
+      }
+    });
+}
+
+async function subscribeToBattleState() {
+  if (battleStateChannel) {
+    try {
+      await supabase.removeChannel(battleStateChannel);
+    } catch (err) {
+      console.log('⚠️ Error removing old battle outcome channel:', err.message);
+    }
+  }
+  
+  const channelName = `battle_outcome_narrator_${Date.now()}`;
+  
+  battleStateChannel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'battle_state'
+      },
+      (payload) => {
+        const wasActive = payload.old?.is_active;
+        const isActive = payload.new?.is_active;
+        const bossName = payload.new?.boss_name || 'The Boss';
+        const bossHealth = payload.new?.boss_health || 0;
+        const ibHealth = payload.new?.ib_health || 0;
+        
+        // Track current boss name
+        if (bossName) {
+          currentBossName = bossName;
+        }
+        
+        // Battle just ended
+        if (wasActive === true && isActive === false) {
+          console.log(`📢 Battle ended! Boss HP: ${bossHealth}, IB HP: ${ibHealth}`);
+          
+          // Determine winner based on health
+          // Victory if boss is at 0 health, defeat if IB is at 0 health
+          if (bossHealth <= 0) {
+            // Victory!
+            sendAnnouncement(`The battle has concluded! YOU were victorious. This realm has been cleansed of corruption!`);
+          } else if (ibHealth <= 0) {
+            // Defeat
+            sendAnnouncement(`The battle has concluded! ${currentBossName} was victorious. This realm remains cloaked in corruption... for now.`);
+          } else {
+            // Battle ended for other reasons (timeout?)
+            sendAnnouncement(`The battle has concluded! The fate of this realm hangs in the balance...`);
+          }
+        }
+      }
+    )
+    .subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('✅ Subscribed to battle_state for narrator');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('❌ Battle state subscription error:', err);
+      }
+    });
 }
 
 // Schedule a reconnection with exponential backoff
@@ -445,9 +843,19 @@ function sendToSupabase(type, user, amount, msg) {
 // ============================================
 process.on('SIGTERM', async () => {
   console.log('🛑 Shutting down...');
-  if (votingPhaseChannel) {
-    await supabase.removeChannel(votingPhaseChannel);
+  
+  // Clean up all channels
+  const channels = [votingPhaseChannel, sequencerStateChannel, bossCompanionsChannel, companionBattleChannel, battleStateChannel];
+  for (const channel of channels) {
+    if (channel) {
+      try {
+        await supabase.removeChannel(channel);
+      } catch (err) {
+        console.log('⚠️ Error removing channel during shutdown:', err.message);
+      }
+    }
   }
+  
   if (twitchClient) {
     await twitchClient.disconnect();
   }

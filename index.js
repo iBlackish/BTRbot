@@ -27,7 +27,7 @@ let currentPhaseVoters = new Set();
 // Track voters for REALM voting phase (max 3 votes per user)
 let realmVotingMode = false;
 let currentEpisodeNumber = 1;
-let userRealmVotes = new Map(); // username → vote count (max 3)
+let userRealmVotes = new Map(); // username -> vote count (max 3)
 let unavailableRealms = []; // realm names from previous episode
 
 // Realm names in order (indices 0-24 map to !1-!25)
@@ -74,18 +74,15 @@ let announcementQueue = [];
 let isProcessingQueue = false;
 const ANNOUNCEMENT_DELAY_MS = 3500; // 3.5 seconds between announcements
 
-// ============================================
-// DYNAMIC ENHANCEMENT TIERS
-// ============================================
-// Default enhancement tiers (fallback if dynamic ones aren't available)
-const DEFAULT_ENHANCEMENT_TIERS = [
-  { id: 1, threshold: 250, name: 'Coral Shield', description: 'iBlackish now deflects minor corruption attacks!' },
-  { id: 2, threshold: 500, name: 'Trident Shard', description: 'iBlackish can now channel ancient sea magic!' },
-  { id: 3, threshold: 750, name: 'Ancient Blessing', description: 'iBlackish now has full protection from shadow!' }
+// Enhancement tier definitions
+const ENHANCEMENT_TIERS = [
+  { threshold: 250, name: 'Coral Shield', description: 'iBlackish now deflects minor corruption attacks!' },
+  { threshold: 500, name: 'Trident Shard', description: 'iBlackish can now channel ancient sea magic!' },
+  { threshold: 750, name: 'Ancient Blessing', description: 'iBlackish now has full protection from shadow!' }
 ];
 
-// Current phase's dynamic enhancements (updated from events_queue)
-let currentPhaseEnhancements = [...DEFAULT_ENHANCEMENT_TIERS];
+// Dynamic enhancement tiers (overridden per phase by AI generation)
+let currentPhaseEnhancements = null;
 
 // ============================================
 // SUPABASE SUBSCRIPTION STATE
@@ -100,6 +97,15 @@ let isSubscribing = false; // Guard to prevent duplicate subscription attempts
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY = 2000; // 2 seconds
+
+// Narrator retry tracking (separate from voting reconnect)
+let narratorRetryAttempts = {
+  sequencer: 0,
+  companions: 0,
+  companionBattle: 0,
+  battleState: 0
+};
+const MAX_NARRATOR_RETRIES = 5;
 
 // ============================================
 // TWITCH CLIENT (initialized after token fetch)
@@ -266,8 +272,11 @@ async function connectTwitch() {
     // Start listening for voting phase events
     subscribeToVotingPhases();
     
-    // Start listening for narrator events (sequencer state, battles, etc.)
-    subscribeToNarratorEvents();
+    // Delay narrator subscriptions to let Realtime connection stabilize
+    console.log('⏳ Waiting 3s before starting narrator subscriptions...');
+    setTimeout(() => {
+      subscribeToNarratorEvents();
+    }, 3000);
     
   } catch (err) {
     console.error('❌ Twitch connection failed:', err.message);
@@ -286,12 +295,11 @@ function handleMessage(channel, tags, message, self) {
 
   // Bits cheers
   if (tags.bits && tags.bits > 0) {
-    const amount = parseInt(tags.bits, 10);
-    console.log(`→ Bits detected: ${amount} from ${username}`);
-    sendToSupabase('channel.cheer', username, amount, '');
+    console.log(`→ Bits detected: ${tags.bits} from ${username}`);
+    sendToSupabase('channel.cheer', username, tags.bits, '');
     
-    // Announce bits donation in chat
-    sendAnnouncement(`✨ ${username} donated ${amount} bits! The Ripple grows stronger!`);
+    // Announce bit donation
+    sendAnnouncement(`✨ ${username} donated ${tags.bits} bits! The Ripple grows stronger!`);
   }
 
   // New sub / resub
@@ -431,34 +439,11 @@ async function subscribeToVotingPhases() {
       (payload) => {
         const eventType = payload.new?.event_type;
         
-        // DYNAMIC ENHANCEMENTS GENERATED - store for use in announcements
-        if (eventType === 'enhancements_generated') {
-          console.log('🎯 DYNAMIC ENHANCEMENTS RECEIVED!');
-          try {
-            const enhancements = JSON.parse(payload.new?.message || '[]');
-            if (Array.isArray(enhancements) && enhancements.length === 3) {
-              // Map to our expected format with thresholds
-              currentPhaseEnhancements = enhancements.map((e, index) => ({
-                id: e.id || index + 1,
-                threshold: e.bitsRequired || [250, 500, 750][index],
-                name: e.name,
-                description: e.description || e.narrativeEffect || 'A powerful enhancement!'
-              }));
-              console.log('✅ Dynamic enhancements loaded:', currentPhaseEnhancements.map(e => e.name).join(', '));
-            }
-          } catch (err) {
-            console.error('❌ Failed to parse dynamic enhancements:', err.message);
-          }
-        }
-        
         // REALM VOTING START - enable realm voting mode
         if (eventType === 'realm_voting_start') {
           console.log('🌍 REALM VOTING PHASE START detected!');
           realmVotingMode = true;
           userRealmVotes.clear();
-          
-          // Reset enhancements to defaults for new episode
-          currentPhaseEnhancements = [...DEFAULT_ENHANCEMENT_TIERS];
           
           // Parse episode info and unavailable realms from message
           try {
@@ -506,12 +491,35 @@ async function subscribeToVotingPhases() {
           }
           
           currentPhaseVoters.clear();
-          announcedEnhancements.clear(); // Reset enhancement announcements for new voting phase
+          
+          // Reset enhancement tracking for new voting phase
+          announcedEnhancements.clear();
+          lastPhaseBitsTotal = 0;
+          currentPhaseEnhancements = null;
+          
           console.log('✅ Story voter list cleared - ready for new voting phase!');
           reconnectAttempts = 0;
           
           // NARRATOR: Voting phase announcement
           sendAnnouncement("🗳️ It's time to vote! Type !1, !2, or !3 to vote for an option. You can also contribute bits towards one of the enhancements on the left side of the screen! If any of the bit levels are reached, it will contribute directly to the story!");
+        }
+        
+        // DYNAMIC ENHANCEMENTS GENERATED - update tier names/descriptions
+        if (eventType === 'enhancements_generated') {
+          console.log('🎯 Dynamic enhancements received!');
+          try {
+            const enhancements = JSON.parse(payload.new?.message || '[]');
+            currentPhaseEnhancements = enhancements.map((e, index) => ({
+              id: e.id || index + 1,
+              threshold: e.bitsRequired || [250, 500, 750][index],
+              name: e.name,
+              description: e.description || e.narrativeEffect || ENHANCEMENT_TIERS[index]?.description || ''
+            }));
+            console.log(`   Loaded ${currentPhaseEnhancements.length} dynamic tiers:`, currentPhaseEnhancements.map(t => t.name));
+          } catch (e) {
+            console.log('   Could not parse enhancements, using defaults');
+            currentPhaseEnhancements = null;
+          }
         }
       }
     )
@@ -536,6 +544,12 @@ async function subscribeToVotingPhases() {
 // ============================================
 async function subscribeToNarratorEvents() {
   console.log('📢 Setting up Narrator event subscriptions...');
+  
+  // Reset narrator retry counts
+  narratorRetryAttempts.sequencer = 0;
+  narratorRetryAttempts.companions = 0;
+  narratorRetryAttempts.companionBattle = 0;
+  narratorRetryAttempts.battleState = 0;
   
   // Subscribe to sequencer_state for phase changes
   await subscribeToSequencerState();
@@ -582,23 +596,18 @@ async function subscribeToSequencerState() {
         // Update current episode number
         currentEpisodeNumber = episodeNumber;
         
-        // Track boss name for battle outcome messages
-        if (newState?.current_realm) {
-          // We'll get the actual boss name from battle_state
-        }
-        
         // EPISODE PHASE CHANGES
         if (newEpisodePhase !== lastEpisodePhase) {
           console.log(`📢 Episode phase changed: ${lastEpisodePhase} → ${newEpisodePhase}`);
           
           // Recap (episodes 2+)
           if (newEpisodePhase === 'recap' && episodeNumber > 1) {
-            sendAnnouncement("📜 Last week on BTR: Becoming the Ripple...");
+            sendAnnouncement("📖 Last week on BTR: Becoming the Ripple...");
           }
           
           // How-to-Play
           if (newEpisodePhase === 'how_to_play') {
-            sendAnnouncement("📖 These are instructions on how to play/choose the adventure!");
+            sendAnnouncement("📋 These are instructions on how to play/choose the adventure!");
           }
           
           // Pre-Battle
@@ -630,15 +639,18 @@ async function subscribeToSequencerState() {
           
           // New segment after lead-in
           if (newPhase === 'playing_segment' && lastSequencerPhase === 'playing_leadin') {
-            sendAnnouncement("🎭 Chat's decision has been implemented! Watch this!");
+            sendAnnouncement("✅ Chat's decision has been implemented! Watch this!");
           }
           
           lastSequencerPhase = newPhase;
         }
         
-        // ENHANCEMENT TIER ANNOUNCEMENTS (using dynamic tier names)
+        // ENHANCEMENT TIER ANNOUNCEMENTS
         if (phaseBitsTotal > lastPhaseBitsTotal) {
-          for (const tier of currentPhaseEnhancements) {
+          // Use dynamic enhancements if available, otherwise fall back to defaults
+          const tiers = currentPhaseEnhancements || ENHANCEMENT_TIERS;
+          
+          for (const tier of tiers) {
             if (phaseBitsTotal >= tier.threshold && !announcedEnhancements.has(tier.threshold)) {
               announcedEnhancements.add(tier.threshold);
               sendAnnouncement(`🎉 ENHANCEMENT UNLOCKED: ${tier.name}! Chat has contributed ${tier.threshold} bits! ${tier.description}`);
@@ -650,14 +662,24 @@ async function subscribeToSequencerState() {
         // Reset enhancement tracking when bits reset (new voting phase)
         if (phaseBitsTotal === 0 && lastPhaseBitsTotal > 0) {
           announcedEnhancements.clear();
+          currentPhaseEnhancements = null;
         }
       }
     )
     .subscribe((status, err) => {
       if (status === 'SUBSCRIBED') {
         console.log('✅ Subscribed to sequencer_state for narrator');
+        narratorRetryAttempts.sequencer = 0;
       } else if (status === 'CHANNEL_ERROR') {
         console.error('❌ Sequencer state subscription error:', err);
+        narratorRetryAttempts.sequencer++;
+        if (narratorRetryAttempts.sequencer <= MAX_NARRATOR_RETRIES) {
+          const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, narratorRetryAttempts.sequencer - 1), 30000);
+          console.log(`🔄 Retrying sequencer subscription in ${delay / 1000}s (attempt ${narratorRetryAttempts.sequencer}/${MAX_NARRATOR_RETRIES})...`);
+          setTimeout(() => subscribeToSequencerState(), delay);
+        } else {
+          console.error('❌ Max retries reached for sequencer_state subscription');
+        }
       }
     });
 }
@@ -684,7 +706,7 @@ async function subscribeToBossCompanions() {
       },
       (payload) => {
         const companion = payload.new;
-        const companionName = companion?.companion_name || companion?.username;
+        const companionName = companion?.companion_name || companion?.username || 'A new companion';
         if (companionName) {
           console.log(`📢 New companion joined: ${companionName}`);
           sendAnnouncement(`⚔️ ${companionName} has joined the battle to fight alongside iBlackish!`);
@@ -694,8 +716,17 @@ async function subscribeToBossCompanions() {
     .subscribe((status, err) => {
       if (status === 'SUBSCRIBED') {
         console.log('✅ Subscribed to boss_companions for narrator');
+        narratorRetryAttempts.companions = 0;
       } else if (status === 'CHANNEL_ERROR') {
         console.error('❌ Boss companions subscription error:', err);
+        narratorRetryAttempts.companions++;
+        if (narratorRetryAttempts.companions <= MAX_NARRATOR_RETRIES) {
+          const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, narratorRetryAttempts.companions - 1), 30000);
+          console.log(`🔄 Retrying companions subscription in ${delay / 1000}s (attempt ${narratorRetryAttempts.companions}/${MAX_NARRATOR_RETRIES})...`);
+          setTimeout(() => subscribeToBossCompanions(), delay);
+        } else {
+          console.error('❌ Max retries reached for boss_companions subscription');
+        }
       }
     });
 }
@@ -735,8 +766,17 @@ async function subscribeToCompanionBattleState() {
     .subscribe((status, err) => {
       if (status === 'SUBSCRIBED') {
         console.log('✅ Subscribed to companion_battle_state for narrator');
+        narratorRetryAttempts.companionBattle = 0;
       } else if (status === 'CHANNEL_ERROR') {
         console.error('❌ Companion battle state subscription error:', err);
+        narratorRetryAttempts.companionBattle++;
+        if (narratorRetryAttempts.companionBattle <= MAX_NARRATOR_RETRIES) {
+          const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, narratorRetryAttempts.companionBattle - 1), 30000);
+          console.log(`🔄 Retrying companion battle subscription in ${delay / 1000}s (attempt ${narratorRetryAttempts.companionBattle}/${MAX_NARRATOR_RETRIES})...`);
+          setTimeout(() => subscribeToCompanionBattleState(), delay);
+        } else {
+          console.error('❌ Max retries reached for companion_battle_state subscription');
+        }
       }
     });
 }
@@ -777,8 +817,6 @@ async function subscribeToBattleState() {
         if (wasActive === true && isActive === false) {
           console.log(`📢 Battle ended! Boss HP: ${bossHealth}, IB HP: ${ibHealth}`);
           
-          // Determine winner based on health
-          // Victory if boss is at 0 health, defeat if IB is at 0 health
           if (bossHealth <= 0) {
             // Victory!
             sendAnnouncement(`🏆 VICTORY! The boss has been defeated! The realm is saved!`);
@@ -786,8 +824,8 @@ async function subscribeToBattleState() {
             // Defeat
             sendAnnouncement(`💀 DEFEAT... The darkness consumes all. But the story continues...`);
           } else {
-            // Battle ended for other reasons (timeout?)
-            sendAnnouncement(`⚔️ The battle has concluded! The fate of this realm hangs in the balance...`);
+            // Battle ended for other reasons
+            sendAnnouncement(`⚡ The battle has concluded! The fate of this realm hangs in the balance...`);
           }
         }
       }
@@ -795,8 +833,17 @@ async function subscribeToBattleState() {
     .subscribe((status, err) => {
       if (status === 'SUBSCRIBED') {
         console.log('✅ Subscribed to battle_state for narrator');
+        narratorRetryAttempts.battleState = 0;
       } else if (status === 'CHANNEL_ERROR') {
         console.error('❌ Battle state subscription error:', err);
+        narratorRetryAttempts.battleState++;
+        if (narratorRetryAttempts.battleState <= MAX_NARRATOR_RETRIES) {
+          const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, narratorRetryAttempts.battleState - 1), 30000);
+          console.log(`🔄 Retrying battle state subscription in ${delay / 1000}s (attempt ${narratorRetryAttempts.battleState}/${MAX_NARRATOR_RETRIES})...`);
+          setTimeout(() => subscribeToBattleState(), delay);
+        } else {
+          console.error('❌ Max retries reached for battle_state subscription');
+        }
       }
     });
 }

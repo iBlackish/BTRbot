@@ -260,10 +260,10 @@ async function connectTwitch() {
     // Set up message handler
     twitchClient.on('message', handleMessage);
 
-    // Handle disconnections
+    // Handle disconnections - tmi.js reconnect: true handles reconnection automatically
+    // DO NOT call connectTwitch() here or it will create duplicate clients
     twitchClient.on('disconnected', (reason) => {
-      console.warn('⚠️ Twitch disconnected:', reason);
-      setTimeout(connectTwitch, 5000);
+      console.warn('⚠️ Twitch disconnected:', reason, '(tmi.js will auto-reconnect)');
     });
 
     await twitchClient.connect();
